@@ -37,3 +37,7 @@ powershell -ExecutionPolicy Bypass -File "[PATH\TO\SCRIPT]" -WslDistro "[WSL DIS
 - If `-WslDistro` is omitted, the script warns and only updates Windows installs.
 - Missing CLIs are skipped.
 - Use `-DryRun` to inspect detection and update commands without changing anything.
+- Successful update commands print `OK`.
+- Winget "no newer package" responses are treated as already up to date, not failures.
+- Codex CLI updates print the detected `codex --version` output afterward when available.
+- WSL npm/pnpm globals installed in system-owned locations may prompt for `sudo`.

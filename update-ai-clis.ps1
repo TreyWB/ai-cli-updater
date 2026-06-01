@@ -33,7 +33,8 @@ function Invoke-Update {
     param(
         [string]$Label,
         [string]$Executable,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [string[]]$BenignExitOutputPatterns = @()
     )
 
     $display = "$Executable $($Arguments -join ' ')".Trim()
@@ -42,13 +43,64 @@ function Invoke-Update {
 
     if ($DryRun) {
         Write-Host "      dry-run: not executed" -ForegroundColor DarkGray
+        return $true
+    }
+
+    $outputLines = New-Object System.Collections.Generic.List[string]
+    & $Executable @Arguments 2>&1 | ForEach-Object {
+        $line = $_.ToString()
+        [void]$outputLines.Add($line)
+        Write-Host $line
+    }
+
+    $exitCode = $LASTEXITCODE
+    $outputText = $outputLines -join [Environment]::NewLine
+    if ($exitCode -eq 0) {
+        Write-Host "OK:   $Label completed." -ForegroundColor Green
+        return $true
+    }
+
+    foreach ($pattern in $BenignExitOutputPatterns) {
+        if ($outputText -match $pattern) {
+            Write-Host "OK:   $Label is already up to date." -ForegroundColor Green
+            return $true
+        }
+    }
+
+    Write-Warning "$Label failed with exit code $exitCode."
+    return $false
+}
+
+function Write-CommandVersion {
+    param(
+        [string]$Label,
+        [string[]]$Commands
+    )
+
+    $command = Get-PreferredCommand $Commands
+    if (-not $command) {
         return
     }
 
-    & $Executable @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "$Label failed with exit code $LASTEXITCODE."
+    $version = (& $command --version 2>$null | Select-Object -First 1)
+    if (-not [string]::IsNullOrWhiteSpace($version)) {
+        Write-Info "$Label version after update: $($version.Trim())"
     }
+}
+
+function Invoke-WingetUpgrade {
+    param(
+        [string]$Label,
+        [string]$PackageId
+    )
+
+    $result = Invoke-Update `
+        -Label $Label `
+        -Executable "winget" `
+        -Arguments @("upgrade", "--id", $PackageId, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity") `
+        -BenignExitOutputPatterns @("No available upgrade found", "No newer package versions are available")
+
+    return $result
 }
 
 function Get-NpmGlobalRoot {
@@ -132,7 +184,18 @@ function Test-WingetPackage {
         return $false
     }
 
-    $output = & winget list --id $PackageId --exact 2>$null
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Stop"
+    try {
+        $output = & winget list --id $PackageId --exact 2>$null
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
     if (-not $output) {
         return $false
     }
@@ -167,6 +230,17 @@ function ConvertTo-WslPath {
     return $null
 }
 
+function Set-UnixTextFile {
+    param(
+        [string]$Path,
+        [string]$Value
+    )
+
+    $unixValue = $Value -replace "`r`n?", "`n"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $unixValue, $utf8NoBom)
+}
+
 function Update-WindowsNpmLikePackage {
     param(
         [string]$Label,
@@ -176,18 +250,21 @@ function Update-WindowsNpmLikePackage {
     $updated = $false
 
     if (Test-NpmGlobalPackage $PackageName) {
-        Invoke-Update "$Label via npm global package '$PackageName'" "npm.cmd" @("install", "-g", "$PackageName@latest")
-        $updated = $true
+        if (Invoke-Update "$Label via npm global package '$PackageName'" "npm.cmd" @("install", "-g", "$PackageName@latest")) {
+            $updated = $true
+        }
     }
 
     if (Test-PnpmGlobalPackage $PackageName) {
-        Invoke-Update "$Label via pnpm global package '$PackageName'" "pnpm" @("add", "-g", "$PackageName@latest")
-        $updated = $true
+        if (Invoke-Update "$Label via pnpm global package '$PackageName'" "pnpm" @("add", "-g", "$PackageName@latest")) {
+            $updated = $true
+        }
     }
 
     if (Test-BunGlobalPackage $PackageName) {
-        Invoke-Update "$Label via bun global package '$PackageName'" "bun" @("add", "-g", "$PackageName@latest")
-        $updated = $true
+        if (Invoke-Update "$Label via bun global package '$PackageName'" "bun" @("add", "-g", "$PackageName@latest")) {
+            $updated = $true
+        }
     }
 
     return $updated
@@ -198,22 +275,26 @@ function Update-WindowsCodex {
     $updated = Update-WindowsNpmLikePackage "Codex" "@openai/codex"
 
     if ($IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
-        Invoke-Update "Codex via Microsoft Store / winget package '9PLM9XGG6VKS'" "winget" @("upgrade", "--id", "9PLM9XGG6VKS", "--exact", "--accept-package-agreements", "--accept-source-agreements")
-        $updated = $true
+        if (Invoke-WingetUpgrade "Codex via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS") {
+            $updated = $true
+        }
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
         Write-Info "Codex Microsoft Store app is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
     if (-not $updated) {
-        $codex = Get-PreferredCommand @("codex.cmd", "codex.exe")
+        $codex = Get-PreferredCommand @("codex.cmd", "codex.exe", "codex")
         if ($codex) {
-            Invoke-Update "Codex via native self-updater" $codex @("update")
-            $updated = $true
+            if (Invoke-Update "Codex via native self-updater" $codex @("update")) {
+                $updated = $true
+            }
         }
     }
 
     if (-not $updated) {
         Write-Skip "Codex is not installed in a recognized Windows location."
+    } elseif (-not $DryRun) {
+        Write-CommandVersion "Codex CLI" @("codex.cmd", "codex.exe", "codex")
     }
 }
 
@@ -224,14 +305,16 @@ function Update-WindowsClaude {
     if (-not $updated) {
         $claude = Get-PreferredCommand @("claude.cmd", "claude.exe", "claude")
         if ($claude) {
-            Invoke-Update "Claude Code via native self-updater" $claude @("update")
-            $updated = $true
+            if (Invoke-Update "Claude Code via native self-updater" $claude @("update")) {
+                $updated = $true
+            }
         }
     }
 
     if ($IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
-        Invoke-Update "Claude Desktop app via winget package 'Anthropic.Claude'" "winget" @("upgrade", "--id", "Anthropic.Claude", "--exact", "--accept-package-agreements", "--accept-source-agreements")
-        $updated = $true
+        if (Invoke-WingetUpgrade "Claude Desktop app via winget package 'Anthropic.Claude'" "Anthropic.Claude") {
+            $updated = $true
+        }
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
         Write-Info "Claude Desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
@@ -246,8 +329,9 @@ function Update-WindowsOpenCode {
     $updated = $false
 
     if (Test-ChocoPackage "opencode") {
-        Invoke-Update "OpenCode via Chocolatey package 'opencode'" "choco" @("upgrade", "opencode", "-y")
-        $updated = $true
+        if (Invoke-Update "OpenCode via Chocolatey package 'opencode'" "choco" @("upgrade", "opencode", "-y")) {
+            $updated = $true
+        }
     }
 
     if (Update-WindowsNpmLikePackage "OpenCode" "opencode-ai") {
@@ -257,8 +341,9 @@ function Update-WindowsOpenCode {
     if (-not $updated) {
         $opencode = Get-PreferredCommand @("opencode.cmd", "opencode.exe", "opencode")
         if ($opencode) {
-            Invoke-Update "OpenCode via native self-updater" $opencode @("upgrade")
-            $updated = $true
+            if (Invoke-Update "OpenCode via native self-updater" $opencode @("upgrade")) {
+                $updated = $true
+            }
         }
     }
 
@@ -273,22 +358,25 @@ function Update-WindowsCursor {
 
     $cursorAgent = Get-PreferredCommand @("cursor-agent.cmd", "cursor-agent.exe", "cursor-agent")
     if ($cursorAgent) {
-        Invoke-Update "Cursor Agent via cursor-agent self-updater" $cursorAgent @("update")
-        $updated = $true
+        if (Invoke-Update "Cursor Agent via cursor-agent self-updater" $cursorAgent @("update")) {
+            $updated = $true
+        }
     }
 
     if (-not $cursorAgent) {
         $agent = Get-PreferredCommand @("agent.cmd", "agent.exe", "agent")
         if ($agent) {
-            Invoke-Update "Cursor Agent via T3Code-style 'agent' self-updater" $agent @("update")
-            $updated = $true
+            if (Invoke-Update "Cursor Agent via T3Code-style 'agent' self-updater" $agent @("update")) {
+                $updated = $true
+            }
         }
     }
 
     foreach ($id in @("Anysphere.Cursor", "Cursor.Cursor")) {
         if ($IncludeDesktopApps -and (Test-WingetPackage $id)) {
-            Invoke-Update "Cursor app via winget package '$id'" "winget" @("upgrade", "--id", $id, "--exact", "--accept-package-agreements", "--accept-source-agreements")
-            $updated = $true
+            if (Invoke-WingetUpgrade "Cursor app via winget package '$id'" $id) {
+                $updated = $true
+            }
         } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage $id)) {
             Write-Info "Cursor app package '$id' is installed; skipping because -IncludeDesktopApps was not specified."
         }
@@ -333,6 +421,58 @@ run_update() {
     return 0
   fi
   "$@"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'OK:   %s completed.\n' "$label"
+    return 0
+  fi
+  printf 'WARNING: %s failed with exit code %s.\n' "$label" "$status"
+  return "$status"
+}
+
+SUDO_VALIDATED=0
+
+ensure_sudo() {
+  if [ "$DRY_RUN" = "1" ]; then
+    return 0
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    printf 'WARNING: sudo is required but is not installed in this WSL distro.\n'
+    return 1
+  fi
+  if [ "$SUDO_VALIDATED" -ne 1 ]; then
+    printf 'INFO: sudo is required for one or more WSL global installs.\n'
+    sudo -v
+    status=$?
+    if [ "$status" -ne 0 ]; then
+      printf 'WARNING: sudo validation failed with exit code %s.\n' "$status"
+      return "$status"
+    fi
+    SUDO_VALIDATED=1
+  fi
+  return 0
+}
+
+path_requires_sudo() {
+  path="$1"
+  [ "$(id -u)" -ne 0 ] && [ -n "$path" ] && [ ! -w "$path" ]
+}
+
+run_update_maybe_sudo() {
+  label="$1"
+  needs_sudo="$2"
+  shift 2
+  if [ "$needs_sudo" = "1" ]; then
+    if ensure_sudo; then
+      run_update "$label" sudo -H "$@"
+      return $?
+    fi
+    return 1
+  fi
+  run_update "$label" "$@"
 }
 
 cmd_path() {
@@ -359,6 +499,20 @@ native_path_for() {
   fi
 }
 
+print_version() {
+  label="$1"
+  command_name="$2"
+  if [ "$DRY_RUN" = "1" ]; then
+    return 0
+  fi
+  if is_native_command "$command_name"; then
+    version="$("$command_name" --version 2>/dev/null | head -n 1)"
+    if [ -n "$version" ]; then
+      printf 'INFO: %s version after update: %s\n' "$label" "$version"
+    fi
+  fi
+}
+
 have_native_npm() {
   path="$(cmd_path npm)"
   [ -n "$path" ] && ! is_windows_path "$path"
@@ -379,9 +533,14 @@ have_npm_global_package() {
 update_npm_global_package() {
   label="$1"
   package="$2"
-  if have_npm_global_package "$package"; then
-    run_update "$label via npm global package '$package'" npm install -g "$package@latest"
-    return 0
+  root="$(npm_global_root)"
+  if [ -n "$root" ] && [ -d "$root/$package" ]; then
+    needs_sudo=0
+    if path_requires_sudo "$root"; then
+      needs_sudo=1
+    fi
+    run_update_maybe_sudo "$label via npm global package '$package'" "$needs_sudo" npm install -g "$package@latest"
+    return $?
   fi
   return 1
 }
@@ -406,9 +565,14 @@ have_pnpm_global_package() {
 update_pnpm_global_package() {
   label="$1"
   package="$2"
-  if have_pnpm_global_package "$package"; then
-    run_update "$label via pnpm global package '$package'" pnpm add -g "$package@latest"
-    return 0
+  root="$(pnpm_global_root)"
+  if [ -n "$root" ] && [ -d "$root/$package" ]; then
+    needs_sudo=0
+    if path_requires_sudo "$root"; then
+      needs_sudo=1
+    fi
+    run_update_maybe_sudo "$label via pnpm global package '$package'" "$needs_sudo" pnpm add -g "$package@latest"
+    return $?
   fi
   return 1
 }
@@ -428,7 +592,7 @@ update_bun_global_package() {
   package="$2"
   if have_native_bun && have_bun_global_package "$package"; then
     run_update "$label via bun global package '$package'" bun add -g "$package@latest"
-    return 0
+    return $?
   fi
   return 1
 }
@@ -448,8 +612,9 @@ codex_updated=1
 update_js_package_methods "Codex" "@openai/codex" && codex_updated=0
 if [ "$codex_updated" -ne 0 ] && is_native_command codex; then
   codex_path="$(native_path_for codex)"
-  run_update "Codex via native self-updater" "$codex_path" update
-  codex_updated=0
+  if run_update "Codex via native self-updater" "$codex_path" update; then
+    codex_updated=0
+  fi
 fi
 if [ "$codex_updated" -ne 0 ]; then
   path="$(cmd_path codex)"
@@ -458,6 +623,8 @@ if [ "$codex_updated" -ne 0 ]; then
   else
     skip "Codex is not installed in a recognized WSL location."
   fi
+else
+  print_version "Codex CLI" codex
 fi
 
 section "Claude"
@@ -465,8 +632,9 @@ claude_updated=1
 update_js_package_methods "Claude Code" "@anthropic-ai/claude-code" && claude_updated=0
 if is_native_command claude; then
   claude_path="$(native_path_for claude)"
-  run_update "Claude Code via native self-updater" "$claude_path" update
-  claude_updated=0
+  if run_update "Claude Code via native self-updater" "$claude_path" update; then
+    claude_updated=0
+  fi
 fi
 if [ "$claude_updated" -ne 0 ]; then
   path="$(cmd_path claude)"
@@ -480,12 +648,14 @@ fi
 section "OpenCode"
 opencode_updated=1
 if [ -x "$HOME/.opencode/bin/opencode" ]; then
-  run_update "OpenCode via native ~/.opencode install" "$HOME/.opencode/bin/opencode" upgrade
-  opencode_updated=0
+  if run_update "OpenCode via native ~/.opencode install" "$HOME/.opencode/bin/opencode" upgrade; then
+    opencode_updated=0
+  fi
 elif is_native_command opencode; then
   opencode_path="$(native_path_for opencode)"
-  run_update "OpenCode via native self-updater" "$opencode_path" upgrade
-  opencode_updated=0
+  if run_update "OpenCode via native self-updater" "$opencode_path" upgrade; then
+    opencode_updated=0
+  fi
 fi
 update_js_package_methods "OpenCode" "opencode-ai" && opencode_updated=0
 if [ "$opencode_updated" -ne 0 ]; then
@@ -501,12 +671,14 @@ section "Cursor"
 cursor_updated=1
 if is_native_command cursor-agent; then
   cursor_agent_path="$(native_path_for cursor-agent)"
-  run_update "Cursor Agent via cursor-agent self-updater" "$cursor_agent_path" update
-  cursor_updated=0
+  if run_update "Cursor Agent via cursor-agent self-updater" "$cursor_agent_path" update; then
+    cursor_updated=0
+  fi
 elif is_native_command agent; then
   agent_path="$(native_path_for agent)"
-  run_update "Cursor Agent via T3Code-style 'agent' self-updater" "$agent_path" update
-  cursor_updated=0
+  if run_update "Cursor Agent via T3Code-style 'agent' self-updater" "$agent_path" update; then
+    cursor_updated=0
+  fi
 fi
 if [ "$cursor_updated" -ne 0 ]; then
   skip "Cursor Agent is not installed in a recognized WSL location."
@@ -514,7 +686,7 @@ fi
 '@
 
     $tempScript = New-TemporaryFile
-    Set-Content -LiteralPath $tempScript.FullName -Value $bashScript -NoNewline -Encoding ASCII
+    Set-UnixTextFile -Path $tempScript.FullName -Value $bashScript
 
     try {
         $wslScriptPath = ConvertTo-WslPath $tempScript.FullName
