@@ -387,6 +387,25 @@ function Update-WindowsCursor {
     }
 }
 
+function Update-WindowsT3Code {
+    Write-Section "Windows T3Code"
+    $updated = Update-WindowsNpmLikePackage "T3Code" "t3"
+
+    if ($IncludeDesktopApps -and (Test-WingetPackage "T3Tools.T3Code")) {
+        if (Invoke-WingetUpgrade "T3Code desktop app via winget package 'T3Tools.T3Code'" "T3Tools.T3Code") {
+            $updated = $true
+        }
+    } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "T3Tools.T3Code")) {
+        Write-Info "T3Code desktop app is installed; skipping because -IncludeDesktopApps was not specified."
+    }
+
+    if (-not $updated) {
+        Write-Skip "T3Code is not installed in a recognized Windows location."
+    } elseif (-not $DryRun) {
+        Write-CommandVersion "T3Code CLI" @("t3.cmd", "t3.exe", "t3")
+    }
+}
+
 function Invoke-WslUpdates {
     param([string]$Distro)
 
@@ -683,6 +702,20 @@ fi
 if [ "$cursor_updated" -ne 0 ]; then
   skip "Cursor Agent is not installed in a recognized WSL location."
 fi
+
+section "T3Code"
+t3code_updated=1
+update_js_package_methods "T3Code" "t3" && t3code_updated=0
+if [ "$t3code_updated" -ne 0 ]; then
+  path="$(cmd_path t3)"
+  if [ -n "$path" ] && is_windows_path "$path"; then
+    skip "T3Code only resolves to a Windows PATH shim in WSL: $path"
+  else
+    skip "T3Code is not installed in a recognized WSL location."
+  fi
+else
+  print_version "T3Code CLI" t3
+fi
 '@
 
     $tempScript = New-TemporaryFile
@@ -718,6 +751,7 @@ Update-WindowsCodex
 Update-WindowsClaude
 Update-WindowsOpenCode
 Update-WindowsCursor
+Update-WindowsT3Code
 
 if ([string]::IsNullOrWhiteSpace($WslDistro)) {
     Write-Section "WSL"
