@@ -85,6 +85,30 @@ function Confirm-ComponentInstall {
     }
 }
 
+function Confirm-Action {
+    param(
+        [string]$Label,
+        [string]$Prompt
+    )
+
+    if ($DryRun) {
+        Write-Host "PROMPT: A live run would ask: $Prompt" -ForegroundColor Magenta
+        return $false
+    }
+
+    while ($true) {
+        $response = Read-Host "$Prompt [y/N]"
+        if ([string]::IsNullOrWhiteSpace($response) -or $response -match "^(?i:n|no)$") {
+            Write-Skip "$Label was declined."
+            return $false
+        }
+        if ($response -match "^(?i:y|yes)$") {
+            return $true
+        }
+        Write-Info "Enter Y to continue or N to skip."
+    }
+}
+
 function Register-UpdateFailure {
     param([string]$Message)
 
@@ -414,6 +438,27 @@ function Install-HostArchitectureNode {
         return $null
     }
 
+    $currentArchitecture = Get-WindowsJsRuntimeArchitecture "npm"
+    if ($currentArchitecture -notin @("Unknown", $script:OsArchitecture) -and (Test-WingetPackage $nodePackageId)) {
+        $runningNode = @(Get-Process -Name "node" -ErrorAction SilentlyContinue)
+        if ($runningNode.Count -gt 0) {
+            $processList = ($runningNode | ForEach-Object { "node (PID $($_.Id))" }) -join ", "
+            $message = "Replacing $currentArchitecture Node.js with $script:OsArchitecture Node.js is blocked by running processes: $processList. Close applications using Node.js and rerun the updater."
+            Write-Warning $message
+            Register-UpdateFailure $message
+            return $null
+        }
+
+        Write-Info "Node.js MSI cannot change architecture in place. Removing the WinGet-managed $currentArchitecture installation before installing $script:OsArchitecture. User-level global npm packages will be retained and Codex will be reinstalled for the new architecture."
+        $uninstallArguments = @(
+            "uninstall", "--id", $nodePackageId, "--exact",
+            "--silent", "--accept-source-agreements", "--disable-interactivity"
+        )
+        if (-not (Invoke-Update "Remove mismatched Node.js LTS dependency ($currentArchitecture)" "winget" $uninstallArguments)) {
+            return $null
+        }
+    }
+
     $arguments = @(
         "install", "--id", $nodePackageId, "--exact",
         "--architecture", $script:WingetArchitecture,
@@ -532,18 +577,34 @@ function Update-WindowsCodex {
 
     if ($jsPackageInstalled) {
         $compatibleRuntimeInstalled = $false
-        if ((Test-NpmGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "npm" "Codex")) {
-            $compatibleRuntimeInstalled = $true
+        $mismatchedManagers = New-Object System.Collections.Generic.List[string]
+        if (Test-NpmGlobalPackage "@openai/codex") {
+            $architecture = Get-WindowsJsRuntimeArchitecture "npm"
+            if ($architecture -eq $script:OsArchitecture) {
+                $compatibleRuntimeInstalled = $true
+            } else {
+                [void]$mismatchedManagers.Add("npm ($architecture)")
+            }
         }
-        if ((Test-PnpmGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "pnpm" "Codex")) {
-            $compatibleRuntimeInstalled = $true
+        if (Test-PnpmGlobalPackage "@openai/codex") {
+            $architecture = Get-WindowsJsRuntimeArchitecture "pnpm"
+            if ($architecture -eq $script:OsArchitecture) {
+                $compatibleRuntimeInstalled = $true
+            } else {
+                [void]$mismatchedManagers.Add("pnpm ($architecture)")
+            }
         }
-        if ((Test-BunGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "bun" "Codex")) {
-            $compatibleRuntimeInstalled = $true
+        if (Test-BunGlobalPackage "@openai/codex") {
+            $architecture = Get-WindowsJsRuntimeArchitecture "bun"
+            if ($architecture -eq $script:OsArchitecture) {
+                $compatibleRuntimeInstalled = $true
+            } else {
+                [void]$mismatchedManagers.Add("bun ($architecture)")
+            }
         }
 
         if ($compatibleRuntimeInstalled) {
-            $runningCodex = Get-RunningCodexProcesses
+            $runningCodex = @(Get-RunningCodexProcesses)
             if ($runningCodex.Count -gt 0 -and -not $DryRun) {
                 $processList = ($runningCodex | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ", "
                 $message = "Codex CLI update is blocked by running Codex processes: $processList. Close Codex sessions (including T3Code/ChatGPT Codex sessions) and rerun the updater."
@@ -551,6 +612,29 @@ function Update-WindowsCodex {
                 Register-UpdateFailure $message
             } else {
                 $cliUpdated = Update-WindowsNpmLikePackage "Codex" "@openai/codex" -RequireHostArchitecture
+            }
+        } elseif ($mismatchedManagers.Count -gt 0) {
+            $managerSummary = $mismatchedManagers -join ", "
+            $prompt = "Codex CLI uses $managerSummary while Windows is $script:OsArchitecture. Install a native $script:OsArchitecture Node.js runtime and migrate Codex?"
+            if (Confirm-Action "Codex architecture migration" $prompt) {
+                $runningCodex = @(Get-RunningCodexProcesses)
+                if ($runningCodex.Count -gt 0) {
+                    $processList = ($runningCodex | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ", "
+                    $message = "Codex architecture migration is blocked by running Codex processes: $processList. Close Codex sessions (including T3Code/ChatGPT Codex sessions) and rerun the updater."
+                    Write-Warning $message
+                    Register-UpdateFailure $message
+                } else {
+                    $cliUpdated = Install-WindowsNpmPackage "Codex CLI $script:OsArchitecture migration" "@openai/codex" -RequireHostArchitecture
+                    if ($cliUpdated) {
+                        if (Test-PnpmGlobalPackage "@openai/codex") {
+                            [void](Invoke-Update "Remove conflicting pnpm Codex installation" "pnpm" @("remove", "-g", "@openai/codex"))
+                        }
+                        if (Test-BunGlobalPackage "@openai/codex") {
+                            [void](Invoke-Update "Remove conflicting bun Codex installation" "bun" @("remove", "-g", "@openai/codex"))
+                        }
+                        Write-Info "Codex CLI was migrated to a native $script:OsArchitecture Node.js runtime. Restart your terminal before using it."
+                    }
+                }
             }
         }
     } else {
@@ -958,9 +1042,119 @@ print_version() {
   fi
 }
 
+if [ -n "${XDG_CONFIG_HOME-}" ]; then
+  NVM_DIR="$XDG_CONFIG_HOME/nvm"
+else
+  NVM_DIR="$HOME/.nvm"
+fi
+export NVM_DIR
+
+load_nvm() {
+  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+    return 1
+  fi
+  # nvm is not nounset-safe. Restore the updater's strict unset-variable
+  # behavior immediately after loading and selecting the default runtime.
+  set +u
+  . "$NVM_DIR/nvm.sh"
+  nvm use --silent default >/dev/null 2>&1 || true
+  set -u
+  return 0
+}
+
+ensure_nvm_profile_file() {
+  profile="$1"
+  marker='# ai-cli-updater: load nvm'
+  if [ ! -e "$profile" ]; then
+    : > "$profile"
+  fi
+  if grep -Fq "$marker" "$profile"; then
+    return 0
+  fi
+  printf '\n%s\n%s\n%s\n%s\n%s\n' \
+    "$marker" \
+    'if [ -n "${XDG_CONFIG_HOME-}" ]; then' \
+    '  export NVM_DIR="$XDG_CONFIG_HOME/nvm"' \
+    'else export NVM_DIR="$HOME/.nvm"; fi' \
+    '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> "$profile"
+}
+
+ensure_nvm_shell_profiles() {
+  ensure_nvm_profile_file "$HOME/.profile"
+  if [ -e "$HOME/.bashrc" ]; then
+    ensure_nvm_profile_file "$HOME/.bashrc"
+  fi
+  if [ -e "$HOME/.zshrc" ]; then
+    ensure_nvm_profile_file "$HOME/.zshrc"
+  fi
+}
+
+run_nvm_update() {
+  label="$1"
+  shift
+  set +u
+  run_update "$label" nvm "$@"
+  status=$?
+  set -u
+  return "$status"
+}
+
+load_nvm || true
+
 have_native_npm() {
   path="$(cmd_path npm)"
   [ -n "$path" ] && ! is_windows_path "$path"
+}
+
+have_supported_t3_node() {
+  if ! is_native_command node || ! have_native_npm; then
+    return 1
+  fi
+  node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit((major === 22 && minor >= 16) || (major === 23 && minor >= 11) || major >= 24 ? 0 : 1)' >/dev/null 2>&1
+}
+
+ensure_supported_t3_node() {
+  if have_supported_t3_node; then
+    return 0
+  fi
+
+  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      printf 'WARNING: T3Code requires curl to install a native WSL Node.js runtime.\n'
+      FAILURES=$((FAILURES + 1))
+      return 1
+    fi
+    if ! run_update "nvm v0.40.4 user-local runtime manager" bash -c 'export PROFILE=/dev/null; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash'; then
+      return 1
+    fi
+  fi
+
+  ensure_nvm_shell_profiles
+  if ! load_nvm; then
+    printf 'WARNING: nvm was installed but could not be loaded from %s.\n' "$NVM_DIR"
+    FAILURES=$((FAILURES + 1))
+    return 1
+  fi
+
+  if ! run_nvm_update "Node.js 24 for T3Code in WSL" install 24; then
+    return 1
+  fi
+  if ! run_nvm_update "Set Node.js 24 as the WSL user default" alias default 24; then
+    return 1
+  fi
+
+  set +u
+  nvm use --silent 24 >/dev/null
+  status=$?
+  set -u
+  if [ "$status" -ne 0 ] || ! have_supported_t3_node; then
+    printf 'WARNING: Node.js 24 was installed but a supported native WSL runtime could not be activated.\n'
+    FAILURES=$((FAILURES + 1))
+    return 1
+  fi
+
+  printf 'INFO: T3Code will use Node.js %s (%s).\n' "$(node --version)" "$(node -p process.arch)"
+  return 0
 }
 
 npm_global_root() {
@@ -984,7 +1178,11 @@ update_npm_global_package() {
     if path_requires_sudo "$root"; then
       needs_sudo=1
     fi
-    run_update_maybe_sudo "$label via npm global package '$package'" "$needs_sudo" npm install -g "$package@latest"
+    if [ "$package" = "t3" ]; then
+      run_update_maybe_sudo "$label via npm global package '$package'" "$needs_sudo" npm install -g --allow-scripts=node-pty,msgpackr-extract "$package@latest"
+    else
+      run_update_maybe_sudo "$label via npm global package '$package'" "$needs_sudo" npm install -g "$package@latest"
+    fi
     return $?
   fi
   return 1
@@ -1053,11 +1251,9 @@ update_js_package_methods() {
 }
 
 install_npm_global_package() {
-  label="$1"
-  package="$2"
-  if ! have_native_npm; then
-    printf 'WARNING: %s requires a native WSL Node.js/npm installation.\n' "$label"
-    FAILURES=$((FAILURES + 1))
+  install_label="$1"
+  install_package="$2"
+  if ! ensure_supported_t3_node; then
     return 1
   fi
   root="$(npm_global_root)"
@@ -1065,7 +1261,7 @@ install_npm_global_package() {
   if path_requires_sudo "$root"; then
     needs_sudo=1
   fi
-  run_update_maybe_sudo "$label install via npm global package '$package'" "$needs_sudo" npm install -g "$package@latest"
+  run_update_maybe_sudo "$install_label install via npm global package '$install_package'" "$needs_sudo" npm install -g --allow-scripts=node-pty,msgpackr-extract "$install_package@latest"
 }
 
 section "Codex"
