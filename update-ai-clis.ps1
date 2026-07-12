@@ -8,6 +8,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
+$script:OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$script:IsWindowsOs = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+$script:IsWindowsArm = $script:IsWindowsOs -and $script:OsArchitecture -in @("Arm", "Arm64")
+
+if (-not $script:IsWindowsOs -or $script:OsArchitecture -notin @("X64", "Arm", "Arm64")) {
+    $platform = if ($script:IsWindowsOs) { "Windows $script:OsArchitecture" } else { "$([System.Environment]::OSVersion.Platform) $script:OsArchitecture" }
+    Write-Error "Unsupported platform: $platform. This script only supports Windows x64 (Windows ARM runs with T3Code skipped). x86 and macOS are not supported."
+    exit 1
+}
+
 function Write-Section {
     param([string]$Title)
     Write-Host ""
@@ -302,27 +312,37 @@ function Update-WindowsCodex {
 
 function Update-WindowsClaude {
     Write-Section "Windows Claude"
-    $updated = Update-WindowsNpmLikePackage "Claude Code" "@anthropic-ai/claude-code"
+    $cliUpdated = Update-WindowsNpmLikePackage "Claude Code" "@anthropic-ai/claude-code"
 
-    if (-not $updated) {
+    if (-not $cliUpdated) {
         $claude = Get-PreferredCommand @("claude.cmd", "claude.exe", "claude")
         if ($claude) {
             if (Invoke-Update "Claude Code via native self-updater" $claude @("update")) {
-                $updated = $true
+                $cliUpdated = $true
             }
         }
     }
 
     if ($IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
-        if (Invoke-WingetUpgrade "Claude Desktop app via winget package 'Anthropic.Claude'" "Anthropic.Claude") {
-            $updated = $true
-        }
+        [void](Invoke-WingetUpgrade "Claude Desktop app via winget package 'Anthropic.Claude'" "Anthropic.Claude")
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
         Write-Info "Claude Desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
-    if (-not $updated) {
-        Write-Skip "Claude Code is not installed in a recognized Windows location."
+    # The Claude Desktop app does not bundle the CLI, so a successful desktop
+    # update must not hide a missing 'claude' command.
+    if (-not $cliUpdated) {
+        Write-Info "Claude Code CLI is not installed (the Claude Desktop app does not include it); installing it now."
+        if (Test-CommandAvailable "npm.cmd") {
+            $cliUpdated = Invoke-Update "Claude Code CLI install via npm" "npm.cmd" @("install", "-g", "@anthropic-ai/claude-code@latest")
+        } else {
+            $cliUpdated = Invoke-Update "Claude Code CLI install via native installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex")
+        }
+        if ($cliUpdated) {
+            Write-Info "Restart your terminal if 'claude' is not yet found on PATH."
+        } else {
+            Write-Skip "Claude Code CLI could not be installed."
+        }
     }
 }
 
@@ -391,6 +411,12 @@ function Update-WindowsCursor {
 
 function Update-WindowsT3Code {
     Write-Section "Windows T3Code"
+
+    if ($script:IsWindowsArm) {
+        Write-Skip "T3Code updates are not supported on Windows ARM ($script:OsArchitecture); skipping."
+        return
+    }
+
     $updated = Update-WindowsNpmLikePackage "T3Code" "t3"
 
     if ($IncludeDesktopApps -and (Test-WingetPackage "T3Tools.T3Code")) {

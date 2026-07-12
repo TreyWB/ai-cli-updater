@@ -34,8 +34,9 @@ powershell -ExecutionPolicy Bypass -File "[PATH\TO\SCRIPT]" -WslDistro "[WSL DIS
 
 ## Notes
 
+- The script only supports Windows x64. It errors on x86 and macOS. On Windows ARM it runs but skips the T3Code update step.
 - If `-WslDistro` is omitted, the script warns and only updates Windows installs.
-- Missing CLIs are skipped.
+- Missing CLIs are skipped, except the Claude Code CLI, which is installed on Windows if not found (via npm when available, otherwise the native installer).
 - Use `-DryRun` to inspect detection and update commands without changing anything.
 - Successful update commands print `OK`.
 - Winget "no newer package" responses are treated as already up to date, not failures.
