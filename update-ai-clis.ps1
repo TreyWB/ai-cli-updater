@@ -8,13 +8,36 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
-$script:OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $script:IsWindowsOs = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
-$script:IsWindowsArm = $script:IsWindowsOs -and $script:OsArchitecture -in @("Arm", "Arm64")
+$script:OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 
-if (-not $script:IsWindowsOs -or $script:OsArchitecture -notin @("X64", "Arm", "Arm64")) {
+# RuntimeInformation can report X64 when x64 PowerShell is running under
+# emulation on Windows ARM64. Prefer the machine-scoped Windows architecture,
+# then use CIM as a secondary host-level signal before accepting the runtime
+# view. This distinction controls which native WinGet binary is installed.
+if ($script:IsWindowsOs) {
+    $machineArchitecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE", "Machine")
+    if ($machineArchitecture -match "^(?i:ARM64)$") {
+        $script:OsArchitecture = "Arm64"
+    } elseif ($machineArchitecture -match "^(?i:AMD64|x86_64)$") {
+        $script:OsArchitecture = "X64"
+    } else {
+        $cimOsArchitecture = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OSArchitecture -First 1
+        if ($cimOsArchitecture -match "(?i:ARM).*(?:64)|64.*(?i:ARM)") {
+            $script:OsArchitecture = "Arm64"
+        } elseif ($cimOsArchitecture -match "(?i:64-bit|x64)") {
+            $script:OsArchitecture = "X64"
+        }
+    }
+}
+
+$script:IsWindowsArm = $script:IsWindowsOs -and $script:OsArchitecture -eq "Arm64"
+$script:WingetArchitecture = if ($script:IsWindowsArm) { "arm64" } else { "x64" }
+
+if (-not $script:IsWindowsOs -or $script:OsArchitecture -notin @("X64", "Arm64")) {
     $platform = if ($script:IsWindowsOs) { "Windows $script:OsArchitecture" } else { "$([System.Environment]::OSVersion.Platform) $script:OsArchitecture" }
-    Write-Error "Unsupported platform: $platform. This script only supports Windows x64 (Windows ARM runs with T3Code skipped). x86 and macOS are not supported."
+    Write-Error "Unsupported platform: $platform. This script supports Windows x64 and Windows ARM64. x86, 32-bit ARM, and macOS are not supported."
     exit 1
 }
 
@@ -101,16 +124,39 @@ function Write-CommandVersion {
 function Invoke-WingetUpgrade {
     param(
         [string]$Label,
-        [string]$PackageId
+        [string]$PackageId,
+        [string]$Architecture
     )
+
+    $arguments = @("upgrade", "--id", $PackageId, "--exact")
+    if (-not [string]::IsNullOrWhiteSpace($Architecture)) {
+        $arguments += @("--architecture", $Architecture)
+    }
+    $arguments += @("--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
 
     $result = Invoke-Update `
         -Label $Label `
         -Executable "winget" `
-        -Arguments @("upgrade", "--id", $PackageId, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity") `
+        -Arguments $arguments `
         -BenignExitOutputPatterns @("No available upgrade found", "No newer package versions are available")
 
     return $result
+}
+
+function Invoke-WingetInstall {
+    param(
+        [string]$Label,
+        [string]$PackageId,
+        [string]$Architecture
+    )
+
+    $arguments = @("install", "--id", $PackageId, "--exact")
+    if (-not [string]::IsNullOrWhiteSpace($Architecture)) {
+        $arguments += @("--architecture", $Architecture)
+    }
+    $arguments += @("--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+
+    return Invoke-Update -Label $Label -Executable "winget" -Arguments $arguments
 }
 
 function Get-NpmGlobalRoot {
@@ -280,6 +326,30 @@ function Update-WindowsNpmLikePackage {
     return $updated
 }
 
+function Remove-WindowsClaudeJsPackages {
+    $allSucceeded = $true
+
+    if (Test-NpmGlobalPackage "@anthropic-ai/claude-code") {
+        if (-not (Invoke-Update "Remove conflicting npm Claude Code installation" "npm.cmd" @("uninstall", "-g", "@anthropic-ai/claude-code"))) {
+            $allSucceeded = $false
+        }
+    }
+
+    if (Test-PnpmGlobalPackage "@anthropic-ai/claude-code") {
+        if (-not (Invoke-Update "Remove conflicting pnpm Claude Code installation" "pnpm" @("remove", "-g", "@anthropic-ai/claude-code"))) {
+            $allSucceeded = $false
+        }
+    }
+
+    if (Test-BunGlobalPackage "@anthropic-ai/claude-code") {
+        if (-not (Invoke-Update "Remove conflicting bun Claude Code installation" "bun" @("remove", "-g", "@anthropic-ai/claude-code"))) {
+            $allSucceeded = $false
+        }
+    }
+
+    return $allSucceeded
+}
+
 function Update-WindowsCodex {
     Write-Section "Windows Codex"
     $updated = Update-WindowsNpmLikePackage "Codex" "@openai/codex"
@@ -312,19 +382,57 @@ function Update-WindowsCodex {
 
 function Update-WindowsClaude {
     Write-Section "Windows Claude"
-    $cliUpdated = Update-WindowsNpmLikePackage "Claude Code" "@anthropic-ai/claude-code"
+    $cliUpdated = $false
+    $wingetAvailable = Test-CommandAvailable "winget"
+    $claudeCodePackageId = "Anthropic.ClaudeCode"
 
-    if (-not $cliUpdated) {
-        $claude = Get-PreferredCommand @("claude.cmd", "claude.exe", "claude")
-        if ($claude) {
-            if (Invoke-Update "Claude Code via native self-updater" $claude @("update")) {
-                $cliUpdated = $true
+    # WinGet selects Anthropic's native binary directly. Supplying the OS
+    # architecture is important on Windows ARM64, where an x64 Node/npm
+    # installation can otherwise select the emulated win32-x64 build.
+    if ($wingetAvailable) {
+        if (Test-WingetPackage $claudeCodePackageId) {
+            $cliUpdated = Invoke-WingetUpgrade `
+                "Claude Code CLI via winget package '$claudeCodePackageId' ($script:WingetArchitecture)" `
+                $claudeCodePackageId `
+                $script:WingetArchitecture
+        } else {
+            $cliUpdated = Invoke-WingetInstall `
+                "Claude Code CLI via winget package '$claudeCodePackageId' ($script:WingetArchitecture)" `
+                $claudeCodePackageId `
+                $script:WingetArchitecture
+        }
+
+        # Multiple claude shims make command resolution dependent on PATH
+        # ordering. Only remove JS-package installs after WinGet succeeded.
+        if ($cliUpdated -and -not (Remove-WindowsClaudeJsPackages)) {
+            Write-Warning "Claude Code was installed through WinGet, but one or more conflicting JavaScript-package installations could not be removed."
+        }
+    } else {
+        Write-Info "WinGet is unavailable; checking existing Claude Code installation methods."
+        $cliUpdated = Update-WindowsNpmLikePackage "Claude Code" "@anthropic-ai/claude-code"
+
+        if (-not $cliUpdated) {
+            $claude = Get-PreferredCommand @("claude.exe", "claude.cmd", "claude")
+            if ($claude) {
+                if (Invoke-Update "Claude Code via native self-updater" $claude @("update")) {
+                    $cliUpdated = $true
+                }
             }
         }
     }
 
-    if ($IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
-        [void](Invoke-WingetUpgrade "Claude Desktop app via winget package 'Anthropic.Claude'" "Anthropic.Claude")
+    if ($IncludeDesktopApps -and $wingetAvailable -and (Test-WingetPackage "Anthropic.Claude")) {
+        [void](Invoke-WingetUpgrade `
+            "Claude Desktop app via winget package 'Anthropic.Claude' ($script:WingetArchitecture)" `
+            "Anthropic.Claude" `
+            $script:WingetArchitecture)
+    } elseif ($IncludeDesktopApps -and $wingetAvailable) {
+        [void](Invoke-WingetInstall `
+            "Claude Desktop app via winget package 'Anthropic.Claude' ($script:WingetArchitecture)" `
+            "Anthropic.Claude" `
+            $script:WingetArchitecture)
+    } elseif ($IncludeDesktopApps) {
+        Write-Skip "Claude Desktop app requires WinGet, but winget is unavailable."
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
         Write-Info "Claude Desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
@@ -333,16 +441,16 @@ function Update-WindowsClaude {
     # update must not hide a missing 'claude' command.
     if (-not $cliUpdated) {
         Write-Info "Claude Code CLI is not installed (the Claude Desktop app does not include it); installing it now."
-        if (Test-CommandAvailable "npm.cmd") {
-            $cliUpdated = Invoke-Update "Claude Code CLI install via npm" "npm.cmd" @("install", "-g", "@anthropic-ai/claude-code@latest")
-        } else {
-            $cliUpdated = Invoke-Update "Claude Code CLI install via native installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex")
-        }
+        $cliUpdated = Invoke-Update "Claude Code CLI install via Anthropic native installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex")
         if ($cliUpdated) {
             Write-Info "Restart your terminal if 'claude' is not yet found on PATH."
         } else {
             Write-Skip "Claude Code CLI could not be installed."
         }
+    }
+
+    if ($cliUpdated -and -not $DryRun) {
+        Write-CommandVersion "Claude Code CLI" @("claude.exe", "claude.cmd", "claude")
     }
 }
 
