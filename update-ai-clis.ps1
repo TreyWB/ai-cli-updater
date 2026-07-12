@@ -8,13 +8,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
-$script:IsWindowsOs = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
-$script:OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$script:IsWindowsOs = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$script:OsArchitecture = "Unknown"
 
-# RuntimeInformation can report X64 when x64 PowerShell is running under
-# emulation on Windows ARM64. Prefer the machine-scoped Windows architecture,
-# then use CIM as a secondary host-level signal before accepting the runtime
-# view. This distinction controls which native WinGet binary is installed.
+# RuntimeInformation.OSArchitecture is unavailable in some Windows PowerShell
+# 5.1/.NET Framework combinations, and can report X64 when x64 PowerShell is
+# running under emulation on Windows ARM64. Prefer host-level Windows signals;
+# only use RuntimeInformation through reflection as a cross-platform fallback.
 if ($script:IsWindowsOs) {
     $machineArchitecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE", "Machine")
     if ($machineArchitecture -match "^(?i:ARM64)$") {
@@ -29,6 +29,12 @@ if ($script:IsWindowsOs) {
         } elseif ($cimOsArchitecture -match "(?i:64-bit|x64)") {
             $script:OsArchitecture = "X64"
         }
+    }
+} else {
+    $runtimeInformationType = [System.Runtime.InteropServices.RuntimeInformation]
+    $osArchitectureProperty = $runtimeInformationType.GetProperty("OSArchitecture")
+    if ($null -ne $osArchitectureProperty) {
+        $script:OsArchitecture = $osArchitectureProperty.GetValue($null, $null).ToString()
     }
 }
 
