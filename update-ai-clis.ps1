@@ -274,12 +274,14 @@ function Update-WindowsCodex {
     Write-Section "Windows Codex"
     $updated = Update-WindowsNpmLikePackage "Codex" "@openai/codex"
 
+    # The standalone Codex desktop app merged into the ChatGPT desktop app (July 2026)
+    # but kept the same Microsoft Store package ID.
     if ($IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
-        if (Invoke-WingetUpgrade "Codex via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS") {
+        if (Invoke-WingetUpgrade "ChatGPT desktop app (includes Codex) via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS") {
             $updated = $true
         }
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
-        Write-Info "Codex Microsoft Store app is installed; skipping because -IncludeDesktopApps was not specified."
+        Write-Info "ChatGPT desktop app (includes Codex) is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
     if (-not $updated) {

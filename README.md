@@ -40,5 +40,6 @@ powershell -ExecutionPolicy Bypass -File "[PATH\TO\SCRIPT]" -WslDistro "[WSL DIS
 - Successful update commands print `OK`.
 - Winget "no newer package" responses are treated as already up to date, not failures.
 - Codex CLI updates print the detected `codex --version` output afterward when available.
+- The standalone Codex desktop app is now the ChatGPT desktop app (same Microsoft Store package); it is updated through winget when `-IncludeDesktopApps` is specified.
 - T3Code updates include globally installed `t3` npm/pnpm/bun packages. The Windows desktop app is updated through winget when `-IncludeDesktopApps` is specified.
 - WSL npm/pnpm globals installed in system-owned locations may prompt for `sudo`.
