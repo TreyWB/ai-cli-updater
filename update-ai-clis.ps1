@@ -7,6 +7,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
+$script:Failures = New-Object System.Collections.Generic.List[string]
 
 $script:IsWindowsOs = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 $script:OsArchitecture = "Unknown"
@@ -63,6 +64,35 @@ function Write-Info {
     Write-Host "INFO: $Message" -ForegroundColor Gray
 }
 
+function Confirm-ComponentInstall {
+    param([string]$Label)
+
+    if ($DryRun) {
+        Write-Host "PROMPT: $Label is not installed; a live run would ask whether to install it." -ForegroundColor Magenta
+        return $false
+    }
+
+    while ($true) {
+        $response = Read-Host "$Label is not installed. Install it? [y/N]"
+        if ([string]::IsNullOrWhiteSpace($response) -or $response -match "^(?i:n|no)$") {
+            Write-Skip "$Label installation was declined."
+            return $false
+        }
+        if ($response -match "^(?i:y|yes)$") {
+            return $true
+        }
+        Write-Info "Enter Y to install or N to skip."
+    }
+}
+
+function Register-UpdateFailure {
+    param([string]$Message)
+
+    if (-not $script:Failures.Contains($Message)) {
+        [void]$script:Failures.Add($Message)
+    }
+}
+
 function Test-CommandAvailable {
     param([string]$Command)
     return $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
@@ -107,6 +137,7 @@ function Invoke-Update {
     }
 
     Write-Warning "$Label failed with exit code $exitCode."
+    Register-UpdateFailure "$Label failed with exit code $exitCode."
     return $false
 }
 
@@ -306,25 +337,32 @@ function Set-UnixTextFile {
 function Update-WindowsNpmLikePackage {
     param(
         [string]$Label,
-        [string]$PackageName
+        [string]$PackageName,
+        [switch]$RequireHostArchitecture
     )
 
     $updated = $false
 
     if (Test-NpmGlobalPackage $PackageName) {
-        if (Invoke-Update "$Label via npm global package '$PackageName'" "npm.cmd" @("install", "-g", "$PackageName@latest")) {
+        if ($RequireHostArchitecture -and -not (Test-WindowsJsRuntimeArchitecture "npm" $Label)) {
+            # Native optional dependencies are selected from Node's architecture.
+        } elseif (Invoke-Update "$Label via npm global package '$PackageName'" "npm.cmd" @("install", "-g", "$PackageName@latest")) {
             $updated = $true
         }
     }
 
     if (Test-PnpmGlobalPackage $PackageName) {
-        if (Invoke-Update "$Label via pnpm global package '$PackageName'" "pnpm" @("add", "-g", "$PackageName@latest")) {
+        if ($RequireHostArchitecture -and -not (Test-WindowsJsRuntimeArchitecture "pnpm" $Label)) {
+            # pnpm uses the same Node runtime architecture check as npm.
+        } elseif (Invoke-Update "$Label via pnpm global package '$PackageName'" "pnpm" @("add", "-g", "$PackageName@latest")) {
             $updated = $true
         }
     }
 
     if (Test-BunGlobalPackage $PackageName) {
-        if (Invoke-Update "$Label via bun global package '$PackageName'" "bun" @("add", "-g", "$PackageName@latest")) {
+        if ($RequireHostArchitecture -and -not (Test-WindowsJsRuntimeArchitecture "bun" $Label)) {
+            # Bun also chooses native dependencies from its own architecture.
+        } elseif (Invoke-Update "$Label via bun global package '$PackageName'" "bun" @("add", "-g", "$PackageName@latest")) {
             $updated = $true
         }
     }
@@ -332,23 +370,143 @@ function Update-WindowsNpmLikePackage {
     return $updated
 }
 
-function Remove-WindowsClaudeJsPackages {
+function Get-WindowsJsRuntimeArchitecture {
+    param([ValidateSet("npm", "pnpm", "bun")][string]$PackageManager)
+
+    $runtimeArchitecture = $null
+    if ($PackageManager -in @("npm", "pnpm") -and (Test-CommandAvailable "node.exe")) {
+        $runtimeArchitecture = (& node.exe -p "process.arch" 2>$null | Select-Object -First 1)
+    } elseif ($PackageManager -eq "bun" -and (Test-CommandAvailable "bun")) {
+        $runtimeArchitecture = (& bun -p "process.arch" 2>$null | Select-Object -First 1)
+    }
+
+    switch -Regex ($runtimeArchitecture) {
+        "^(?i:arm64)$" { return "Arm64" }
+        "^(?i:x64|amd64|x86_64)$" { return "X64" }
+        default { return "Unknown" }
+    }
+}
+
+function Get-HostArchitectureNpmCommand {
+    if ((Test-CommandAvailable "npm.cmd") -and (Get-WindowsJsRuntimeArchitecture "npm") -eq $script:OsArchitecture) {
+        return (Get-PreferredCommand @("npm.cmd"))
+    }
+
+    $programFilesNpm = Join-Path $env:ProgramFiles "nodejs\npm.cmd"
+    $programFilesNode = Join-Path $env:ProgramFiles "nodejs\node.exe"
+    if ((Test-Path $programFilesNpm) -and (Test-Path $programFilesNode)) {
+        $architecture = (& $programFilesNode -p "process.arch" 2>$null | Select-Object -First 1)
+        if (($architecture -eq "arm64" -and $script:OsArchitecture -eq "Arm64") -or
+            ($architecture -eq "x64" -and $script:OsArchitecture -eq "X64")) {
+            return $programFilesNpm
+        }
+    }
+
+    return $null
+}
+
+function Install-HostArchitectureNode {
+    $nodePackageId = "OpenJS.NodeJS.LTS"
+    if (-not (Test-CommandAvailable "winget")) {
+        $message = "A $script:OsArchitecture Node.js runtime is required, but WinGet is unavailable."
+        Write-Warning $message
+        Register-UpdateFailure $message
+        return $null
+    }
+
+    $arguments = @(
+        "install", "--id", $nodePackageId, "--exact",
+        "--architecture", $script:WingetArchitecture,
+        "--force", "--silent",
+        "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"
+    )
+    if (-not (Invoke-Update "Node.js LTS dependency ($script:WingetArchitecture)" "winget" $arguments)) {
+        return $null
+    }
+
+    $npmCommand = Get-HostArchitectureNpmCommand
+    if (-not $npmCommand) {
+        $message = "Node.js was installed, but a $script:OsArchitecture npm runtime could not be resolved. Restart the terminal and rerun the updater."
+        Write-Warning $message
+        Register-UpdateFailure $message
+        return $null
+    }
+
+    return $npmCommand
+}
+
+function Install-WindowsNpmPackage {
+    param(
+        [string]$Label,
+        [string]$PackageName,
+        [switch]$RequireHostArchitecture
+    )
+
+    $npmCommand = if ($RequireHostArchitecture) {
+        Get-HostArchitectureNpmCommand
+    } else {
+        Get-PreferredCommand @("npm.cmd")
+    }
+
+    if (-not $npmCommand) {
+        $npmCommand = Install-HostArchitectureNode
+    }
+    if (-not $npmCommand) {
+        return $false
+    }
+
+    return Invoke-Update "$Label install via npm global package '$PackageName'" $npmCommand @("install", "-g", "$PackageName@latest")
+}
+
+function Test-WindowsJsRuntimeArchitecture {
+    param(
+        [ValidateSet("npm", "pnpm", "bun")][string]$PackageManager,
+        [string]$Label
+    )
+
+    $runtimeArchitecture = Get-WindowsJsRuntimeArchitecture $PackageManager
+    if ($runtimeArchitecture -eq $script:OsArchitecture) {
+        return $true
+    }
+
+    $message = "$Label via $PackageManager was skipped: its runtime is $runtimeArchitecture but the Windows host is $script:OsArchitecture. Install a matching $script:OsArchitecture runtime or update this CLI inside WSL."
+    Write-Skip $message
+    if (-not $DryRun) {
+        Register-UpdateFailure $message
+    }
+    return $false
+}
+
+function Test-WindowsNpmLikePackage {
+    param([string]$PackageName)
+
+    return (Test-NpmGlobalPackage $PackageName) -or
+        (Test-PnpmGlobalPackage $PackageName) -or
+        (Test-BunGlobalPackage $PackageName)
+}
+
+function Remove-WindowsNpmLikePackage {
+    param(
+        [string]$Label,
+        [string]$PackageName
+    )
+
     $allSucceeded = $true
 
-    if (Test-NpmGlobalPackage "@anthropic-ai/claude-code") {
-        if (-not (Invoke-Update "Remove conflicting npm Claude Code installation" "npm.cmd" @("uninstall", "-g", "@anthropic-ai/claude-code"))) {
+    if (Test-NpmGlobalPackage $PackageName) {
+        if (-not (Invoke-Update "Remove conflicting npm $Label installation" "npm.cmd" @("uninstall", "-g", $PackageName))) {
             $allSucceeded = $false
         }
     }
 
-    if (Test-PnpmGlobalPackage "@anthropic-ai/claude-code") {
-        if (-not (Invoke-Update "Remove conflicting pnpm Claude Code installation" "pnpm" @("remove", "-g", "@anthropic-ai/claude-code"))) {
+    if (Test-PnpmGlobalPackage $PackageName) {
+        if (-not (Invoke-Update "Remove conflicting pnpm $Label installation" "pnpm" @("remove", "-g", $PackageName))) {
             $allSucceeded = $false
         }
     }
 
-    if (Test-BunGlobalPackage "@anthropic-ai/claude-code") {
-        if (-not (Invoke-Update "Remove conflicting bun Claude Code installation" "bun" @("remove", "-g", "@anthropic-ai/claude-code"))) {
+    if (Test-BunGlobalPackage $PackageName) {
+        if (-not (Invoke-Update "Remove conflicting bun $Label installation" "bun" @("remove", "-g", $PackageName))) {
             $allSucceeded = $false
         }
     }
@@ -356,33 +514,76 @@ function Remove-WindowsClaudeJsPackages {
     return $allSucceeded
 }
 
+function Remove-WindowsClaudeJsPackages {
+    return Remove-WindowsNpmLikePackage "Claude Code" "@anthropic-ai/claude-code"
+}
+
+function Get-RunningCodexProcesses {
+    return @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessName -match "^(?i:codex)(?:$|-|\.)"
+    })
+}
+
 function Update-WindowsCodex {
     Write-Section "Windows Codex"
-    $updated = Update-WindowsNpmLikePackage "Codex" "@openai/codex"
+    $cliUpdated = $false
+    $jsPackageInstalled = Test-WindowsNpmLikePackage "@openai/codex"
+    $codexCommand = Get-PreferredCommand @("codex.cmd", "codex.exe", "codex")
+
+    if ($jsPackageInstalled) {
+        $compatibleRuntimeInstalled = $false
+        if ((Test-NpmGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "npm" "Codex")) {
+            $compatibleRuntimeInstalled = $true
+        }
+        if ((Test-PnpmGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "pnpm" "Codex")) {
+            $compatibleRuntimeInstalled = $true
+        }
+        if ((Test-BunGlobalPackage "@openai/codex") -and (Test-WindowsJsRuntimeArchitecture "bun" "Codex")) {
+            $compatibleRuntimeInstalled = $true
+        }
+
+        if ($compatibleRuntimeInstalled) {
+            $runningCodex = Get-RunningCodexProcesses
+            if ($runningCodex.Count -gt 0 -and -not $DryRun) {
+                $processList = ($runningCodex | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ", "
+                $message = "Codex CLI update is blocked by running Codex processes: $processList. Close Codex sessions (including T3Code/ChatGPT Codex sessions) and rerun the updater."
+                Write-Warning $message
+                Register-UpdateFailure $message
+            } else {
+                $cliUpdated = Update-WindowsNpmLikePackage "Codex" "@openai/codex" -RequireHostArchitecture
+            }
+        }
+    } else {
+        if ($codexCommand) {
+            $cliUpdated = Invoke-Update "Codex via native self-updater" $codexCommand @("update")
+        } elseif (Confirm-ComponentInstall "Codex CLI") {
+            $cliUpdated = Install-WindowsNpmPackage "Codex CLI" "@openai/codex" -RequireHostArchitecture
+            if ($cliUpdated) {
+                Write-Info "Restart your terminal if 'codex' is not yet found on PATH."
+            }
+        }
+    }
 
     # The standalone Codex desktop app merged into the ChatGPT desktop app (July 2026)
     # but kept the same Microsoft Store package ID.
     if ($IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
-        if (Invoke-WingetUpgrade "ChatGPT desktop app (includes Codex) via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS") {
-            $updated = $true
+        [void](Invoke-WingetUpgrade "ChatGPT desktop app (includes Codex) via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS")
+    } elseif ($IncludeDesktopApps -and (Confirm-ComponentInstall "ChatGPT desktop app")) {
+        if (Test-CommandAvailable "winget") {
+            [void](Invoke-WingetInstall "ChatGPT desktop app via Microsoft Store / winget package '9PLM9XGG6VKS'" "9PLM9XGG6VKS")
+        } else {
+            $message = "ChatGPT desktop app installation requires WinGet, but winget is unavailable."
+            Write-Warning $message
+            Register-UpdateFailure $message
         }
     } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "9PLM9XGG6VKS")) {
         Write-Info "ChatGPT desktop app (includes Codex) is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
-    if (-not $updated) {
-        $codex = Get-PreferredCommand @("codex.cmd", "codex.exe", "codex")
-        if ($codex) {
-            if (Invoke-Update "Codex via native self-updater" $codex @("update")) {
-                $updated = $true
-            }
-        }
-    }
-
-    if (-not $updated) {
-        Write-Skip "Codex is not installed in a recognized Windows location."
+    if (-not $cliUpdated -and -not $jsPackageInstalled -and -not $codexCommand) {
+        Write-Skip "Codex CLI was not installed."
     } elseif (-not $DryRun) {
-        Write-CommandVersion "Codex CLI" @("codex.cmd", "codex.exe", "codex")
+        Write-CommandVersion "Codex CLI current" @("codex.cmd", "codex.exe", "codex")
     }
 }
 
@@ -391,17 +592,21 @@ function Update-WindowsClaude {
     $cliUpdated = $false
     $wingetAvailable = Test-CommandAvailable "winget"
     $claudeCodePackageId = "Anthropic.ClaudeCode"
+    $wingetCliInstalled = Test-WingetPackage $claudeCodePackageId
+    $otherCliInstalled = (Test-WindowsNpmLikePackage "@anthropic-ai/claude-code") -or
+        $null -ne (Get-PreferredCommand @("claude.exe", "claude.cmd", "claude"))
+    $cliInstalled = $wingetCliInstalled -or $otherCliInstalled
 
     # WinGet selects Anthropic's native binary directly. Supplying the OS
     # architecture is important on Windows ARM64, where an x64 Node/npm
     # installation can otherwise select the emulated win32-x64 build.
     if ($wingetAvailable) {
-        if (Test-WingetPackage $claudeCodePackageId) {
+        if ($wingetCliInstalled) {
             $cliUpdated = Invoke-WingetUpgrade `
                 "Claude Code CLI via winget package '$claudeCodePackageId' ($script:WingetArchitecture)" `
                 $claudeCodePackageId `
                 $script:WingetArchitecture
-        } else {
+        } elseif ($cliInstalled -or (Confirm-ComponentInstall "Claude Code CLI")) {
             $cliUpdated = Invoke-WingetInstall `
                 "Claude Code CLI via winget package '$claudeCodePackageId' ($script:WingetArchitecture)" `
                 $claudeCodePackageId `
@@ -425,34 +630,35 @@ function Update-WindowsClaude {
                 }
             }
         }
+
+        if (-not $cliInstalled -and (Confirm-ComponentInstall "Claude Code CLI")) {
+            $cliUpdated = Invoke-Update "Claude Code CLI install via Anthropic native installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex")
+            if ($cliUpdated) {
+                Write-Info "Restart your terminal if 'claude' is not yet found on PATH."
+            }
+        }
     }
 
-    if ($IncludeDesktopApps -and $wingetAvailable -and (Test-WingetPackage "Anthropic.Claude")) {
+    $claudeDesktopInstalled = Test-WingetPackage "Anthropic.Claude"
+    if ($IncludeDesktopApps -and $wingetAvailable -and $claudeDesktopInstalled) {
         [void](Invoke-WingetUpgrade `
             "Claude Desktop app via winget package 'Anthropic.Claude' ($script:WingetArchitecture)" `
             "Anthropic.Claude" `
             $script:WingetArchitecture)
-    } elseif ($IncludeDesktopApps -and $wingetAvailable) {
+    } elseif ($IncludeDesktopApps -and $wingetAvailable -and (Confirm-ComponentInstall "Claude Desktop app")) {
         [void](Invoke-WingetInstall `
             "Claude Desktop app via winget package 'Anthropic.Claude' ($script:WingetArchitecture)" `
             "Anthropic.Claude" `
             $script:WingetArchitecture)
-    } elseif ($IncludeDesktopApps) {
+    } elseif ($IncludeDesktopApps -and -not $wingetAvailable -and (Confirm-ComponentInstall "Claude Desktop app")) {
         Write-Skip "Claude Desktop app requires WinGet, but winget is unavailable."
-    } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "Anthropic.Claude")) {
+        Register-UpdateFailure "Claude Desktop app installation requires WinGet, but winget is unavailable."
+    } elseif (-not $IncludeDesktopApps -and $claudeDesktopInstalled) {
         Write-Info "Claude Desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
-    # The Claude Desktop app does not bundle the CLI, so a successful desktop
-    # update must not hide a missing 'claude' command.
-    if (-not $cliUpdated) {
-        Write-Info "Claude Code CLI is not installed (the Claude Desktop app does not include it); installing it now."
-        $cliUpdated = Invoke-Update "Claude Code CLI install via Anthropic native installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex")
-        if ($cliUpdated) {
-            Write-Info "Restart your terminal if 'claude' is not yet found on PATH."
-        } else {
-            Write-Skip "Claude Code CLI could not be installed."
-        }
+    if (-not $cliUpdated -and -not $cliInstalled) {
+        Write-Skip "Claude Code CLI was not installed."
     }
 
     if ($cliUpdated -and -not $DryRun) {
@@ -463,39 +669,71 @@ function Update-WindowsClaude {
 function Update-WindowsOpenCode {
     Write-Section "Windows OpenCode"
     $updated = $false
+    $wingetPackageId = "SST.opencode"
+    $wingetInstalled = Test-WingetPackage $wingetPackageId
+    $otherInstallPresent = (Test-ChocoPackage "opencode") -or
+        (Test-WindowsNpmLikePackage "opencode-ai") -or
+        $null -ne (Get-PreferredCommand @("opencode.exe", "opencode.cmd", "opencode"))
+    $installed = $wingetInstalled -or $otherInstallPresent
 
-    if (Test-ChocoPackage "opencode") {
-        if (Invoke-Update "OpenCode via Chocolatey package 'opencode'" "choco" @("upgrade", "opencode", "-y")) {
+    if (Test-CommandAvailable "winget") {
+        if ($wingetInstalled) {
+            $updated = Invoke-WingetUpgrade `
+                "OpenCode via winget package '$wingetPackageId' ($script:WingetArchitecture)" `
+                $wingetPackageId `
+                $script:WingetArchitecture
+        } elseif ($installed -or (Confirm-ComponentInstall "OpenCode CLI")) {
+            $updated = Invoke-WingetInstall `
+                "OpenCode via winget package '$wingetPackageId' ($script:WingetArchitecture)" `
+                $wingetPackageId `
+                $script:WingetArchitecture
+        }
+
+        if ($updated) {
+            if (-not (Remove-WindowsNpmLikePackage "OpenCode" "opencode-ai")) {
+                Write-Warning "OpenCode was installed through WinGet, but a conflicting JavaScript-package installation could not be removed."
+            }
+
+            if (Test-ChocoPackage "opencode") {
+                [void](Invoke-Update "Remove conflicting Chocolatey OpenCode installation" "choco" @("uninstall", "opencode", "-y"))
+            }
+        }
+    } elseif (-not $script:IsWindowsArm) {
+        Write-Info "WinGet is unavailable; falling back to recognized x64 OpenCode installation methods."
+        if (Test-ChocoPackage "opencode") {
+            $updated = Invoke-Update "OpenCode via Chocolatey package 'opencode'" "choco" @("upgrade", "opencode", "-y")
+        }
+        if (Update-WindowsNpmLikePackage "OpenCode" "opencode-ai" -RequireHostArchitecture) {
             $updated = $true
         }
-    }
-
-    if (Update-WindowsNpmLikePackage "OpenCode" "opencode-ai") {
-        $updated = $true
-    }
-
-    if (-not $updated) {
-        $opencode = Get-PreferredCommand @("opencode.cmd", "opencode.exe", "opencode")
-        if ($opencode) {
-            if (Invoke-Update "OpenCode via native self-updater" $opencode @("upgrade")) {
-                $updated = $true
+        if (-not $installed -and (Confirm-ComponentInstall "OpenCode CLI")) {
+            $updated = Install-WindowsNpmPackage "OpenCode CLI" "opencode-ai" -RequireHostArchitecture
+        }
+    } else {
+        if ($installed -or (Confirm-ComponentInstall "OpenCode CLI")) {
+            $message = "OpenCode requires WinGet on Windows ARM64 so the native arm64 package can be selected safely."
+            Write-Skip $message
+            if (-not $DryRun) {
+                Register-UpdateFailure $message
             }
         }
     }
 
-    if (-not $updated) {
-        Write-Skip "OpenCode is not installed in a recognized Windows location."
+    if (-not $updated -and -not $installed) {
+        Write-Skip "OpenCode CLI was not installed."
+    } elseif (-not $DryRun) {
+        Write-CommandVersion "OpenCode CLI" @("opencode.exe", "opencode.cmd", "opencode")
     }
 }
 
 function Update-WindowsCursor {
     Write-Section "Windows Cursor"
-    $updated = $false
+    $cliUpdated = $false
 
     $cursorAgent = Get-PreferredCommand @("cursor-agent.cmd", "cursor-agent.exe", "cursor-agent")
     if ($cursorAgent) {
         if (Invoke-Update "Cursor Agent via cursor-agent self-updater" $cursorAgent @("update")) {
-            $updated = $true
+            $cliUpdated = $true
         }
     }
 
@@ -503,23 +741,34 @@ function Update-WindowsCursor {
         $agent = Get-PreferredCommand @("agent.cmd", "agent.exe", "agent")
         if ($agent) {
             if (Invoke-Update "Cursor Agent via T3Code-style 'agent' self-updater" $agent @("update")) {
-                $updated = $true
+                $cliUpdated = $true
+            }
+        } elseif (Confirm-ComponentInstall "Cursor Agent CLI") {
+            $cliUpdated = Invoke-Update "Cursor Agent CLI via official Windows installer" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm 'https://cursor.com/install?win32=true' | iex")
+            if ($cliUpdated) {
+                Write-Info "Restart your terminal if 'cursor-agent' is not yet found on PATH."
             }
         }
     }
 
-    foreach ($id in @("Anysphere.Cursor", "Cursor.Cursor")) {
-        if ($IncludeDesktopApps -and (Test-WingetPackage $id)) {
-            if (Invoke-WingetUpgrade "Cursor app via winget package '$id'" $id) {
-                $updated = $true
-            }
-        } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage $id)) {
-            Write-Info "Cursor app package '$id' is installed; skipping because -IncludeDesktopApps was not specified."
+    $cursorDesktopId = "Anysphere.Cursor"
+    $cursorDesktopInstalled = Test-WingetPackage $cursorDesktopId
+    if ($IncludeDesktopApps -and $cursorDesktopInstalled) {
+        [void](Invoke-WingetUpgrade "Cursor desktop app via winget package '$cursorDesktopId' ($script:WingetArchitecture)" $cursorDesktopId $script:WingetArchitecture)
+    } elseif ($IncludeDesktopApps -and (Confirm-ComponentInstall "Cursor desktop app")) {
+        if (Test-CommandAvailable "winget") {
+            [void](Invoke-WingetInstall "Cursor desktop app via winget package '$cursorDesktopId' ($script:WingetArchitecture)" $cursorDesktopId $script:WingetArchitecture)
+        } else {
+            $message = "Cursor desktop app installation requires WinGet, but winget is unavailable."
+            Write-Warning $message
+            Register-UpdateFailure $message
         }
+    } elseif (-not $IncludeDesktopApps -and $cursorDesktopInstalled) {
+        Write-Info "Cursor desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
-    if (-not $updated) {
-        Write-Skip "Cursor / Cursor Agent is not installed in a recognized Windows location."
+    if (-not $cliUpdated -and -not $cursorAgent -and -not (Get-PreferredCommand @("agent.cmd", "agent.exe", "agent"))) {
+        Write-Skip "Cursor Agent CLI was not installed."
     }
 }
 
@@ -527,22 +776,35 @@ function Update-WindowsT3Code {
     Write-Section "Windows T3Code"
 
     if ($script:IsWindowsArm) {
-        Write-Skip "T3Code updates are not supported on Windows ARM ($script:OsArchitecture); skipping."
+        Write-Skip "T3Code is not natively supported on Windows ARM64. Its CLI and desktop app will not be installed or updated."
         return
     }
 
-    $updated = Update-WindowsNpmLikePackage "T3Code" "t3"
+    $cliInstalled = (Test-WindowsNpmLikePackage "t3") -or
+        $null -ne (Get-PreferredCommand @("t3.cmd", "t3.exe", "t3"))
+    $cliUpdated = Update-WindowsNpmLikePackage "T3Code" "t3"
+    if (-not $cliInstalled -and (Confirm-ComponentInstall "T3Code CLI")) {
+        $cliUpdated = Install-WindowsNpmPackage "T3Code CLI" "t3" -RequireHostArchitecture
+    }
 
-    if ($IncludeDesktopApps -and (Test-WingetPackage "T3Tools.T3Code")) {
-        if (Invoke-WingetUpgrade "T3Code desktop app via winget package 'T3Tools.T3Code'" "T3Tools.T3Code") {
-            $updated = $true
+    $desktopPackageId = "T3Tools.T3Code"
+    $desktopInstalled = Test-WingetPackage $desktopPackageId
+    if ($IncludeDesktopApps -and $desktopInstalled) {
+        [void](Invoke-WingetUpgrade "T3Code desktop app via winget package '$desktopPackageId' (x64)" $desktopPackageId "x64")
+    } elseif ($IncludeDesktopApps -and (Confirm-ComponentInstall "T3Code desktop app")) {
+        if (Test-CommandAvailable "winget") {
+            [void](Invoke-WingetInstall "T3Code desktop app via winget package '$desktopPackageId' (x64)" $desktopPackageId "x64")
+        } else {
+            $message = "T3Code desktop app installation requires WinGet, but winget is unavailable."
+            Write-Warning $message
+            Register-UpdateFailure $message
         }
-    } elseif (-not $IncludeDesktopApps -and (Test-WingetPackage "T3Tools.T3Code")) {
+    } elseif (-not $IncludeDesktopApps -and $desktopInstalled) {
         Write-Info "T3Code desktop app is installed; skipping because -IncludeDesktopApps was not specified."
     }
 
-    if (-not $updated) {
-        Write-Skip "T3Code is not installed in a recognized Windows location."
+    if (-not $cliUpdated -and -not $cliInstalled) {
+        Write-Skip "T3Code CLI was not installed."
     } elseif (-not $DryRun) {
         Write-CommandVersion "T3Code CLI" @("t3.cmd", "t3.exe", "t3")
     }
@@ -562,7 +824,8 @@ function Invoke-WslUpdates {
 set -u
 
 DRY_RUN="${T3_UPDATE_DRY_RUN:-0}"
-export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+FAILURES=0
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.cursor/bin:$PATH"
 
 section() {
   printf '\n== WSL %s ==\n' "$1"
@@ -570,6 +833,26 @@ section() {
 
 skip() {
   printf 'SKIP: %s\n' "$1"
+}
+
+confirm_install() {
+  label="$1"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'PROMPT: %s is not installed; a live run would ask whether to install it.\n' "$label"
+    return 1
+  fi
+  while true; do
+    printf '%s is not installed. Install it? [y/N] ' "$label"
+    IFS= read -r response || response=""
+    case "$response" in
+      y|Y|yes|YES|Yes) return 0 ;;
+      ""|n|N|no|NO|No)
+        skip "$label installation was declined."
+        return 1
+        ;;
+      *) printf 'INFO: Enter Y to install or N to skip.\n' ;;
+    esac
+  done
 }
 
 run_update() {
@@ -588,6 +871,7 @@ run_update() {
     return 0
   fi
   printf 'WARNING: %s failed with exit code %s.\n' "$label" "$status"
+  FAILURES=$((FAILURES + 1))
   return "$status"
 }
 
@@ -768,6 +1052,22 @@ update_js_package_methods() {
   return "$updated"
 }
 
+install_npm_global_package() {
+  label="$1"
+  package="$2"
+  if ! have_native_npm; then
+    printf 'WARNING: %s requires a native WSL Node.js/npm installation.\n' "$label"
+    FAILURES=$((FAILURES + 1))
+    return 1
+  fi
+  root="$(npm_global_root)"
+  needs_sudo=0
+  if path_requires_sudo "$root"; then
+    needs_sudo=1
+  fi
+  run_update_maybe_sudo "$label install via npm global package '$package'" "$needs_sudo" npm install -g "$package@latest"
+}
+
 section "Codex"
 codex_updated=1
 update_js_package_methods "Codex" "@openai/codex" && codex_updated=0
@@ -779,12 +1079,15 @@ if [ "$codex_updated" -ne 0 ] && is_native_command codex; then
 fi
 if [ "$codex_updated" -ne 0 ]; then
   path="$(cmd_path codex)"
-  if [ -n "$path" ] && is_windows_path "$path"; then
+  if confirm_install "Codex CLI in WSL"; then
+    if run_update "Codex CLI via official standalone installer" bash -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'; then
+      codex_updated=0
+    fi
+  elif [ -n "$path" ] && is_windows_path "$path"; then
     skip "Codex only resolves to a Windows PATH shim in WSL: $path"
-  else
-    skip "Codex is not installed in a recognized WSL location."
   fi
-else
+fi
+if [ "$codex_updated" -eq 0 ]; then
   print_version "Codex CLI" codex
 fi
 
@@ -799,10 +1102,12 @@ if is_native_command claude; then
 fi
 if [ "$claude_updated" -ne 0 ]; then
   path="$(cmd_path claude)"
-  if [ -n "$path" ] && is_windows_path "$path"; then
+  if confirm_install "Claude Code CLI in WSL"; then
+    if run_update "Claude Code CLI via Anthropic native installer" bash -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
+      claude_updated=0
+    fi
+  elif [ -n "$path" ] && is_windows_path "$path"; then
     skip "Claude only resolves to a Windows PATH shim in WSL: $path"
-  else
-    skip "Claude Code is not installed in a recognized WSL location."
   fi
 fi
 
@@ -821,10 +1126,12 @@ fi
 update_js_package_methods "OpenCode" "opencode-ai" && opencode_updated=0
 if [ "$opencode_updated" -ne 0 ]; then
   path="$(cmd_path opencode)"
-  if [ -n "$path" ] && is_windows_path "$path"; then
+  if confirm_install "OpenCode CLI in WSL"; then
+    if run_update "OpenCode CLI via official installer" bash -c 'curl -fsSL https://opencode.ai/install | bash'; then
+      opencode_updated=0
+    fi
+  elif [ -n "$path" ] && is_windows_path "$path"; then
     skip "OpenCode only resolves to a Windows PATH shim in WSL: $path"
-  else
-    skip "OpenCode is not installed in a recognized WSL location."
   fi
 fi
 
@@ -842,7 +1149,11 @@ elif is_native_command agent; then
   fi
 fi
 if [ "$cursor_updated" -ne 0 ]; then
-  skip "Cursor Agent is not installed in a recognized WSL location."
+  if confirm_install "Cursor Agent CLI in WSL"; then
+    if run_update "Cursor Agent CLI via official installer" bash -c 'curl -fsSL https://cursor.com/install | bash'; then
+      cursor_updated=0
+    fi
+  fi
 fi
 
 section "T3Code"
@@ -850,13 +1161,21 @@ t3code_updated=1
 update_js_package_methods "T3Code" "t3" && t3code_updated=0
 if [ "$t3code_updated" -ne 0 ]; then
   path="$(cmd_path t3)"
-  if [ -n "$path" ] && is_windows_path "$path"; then
+  if confirm_install "T3Code CLI in WSL"; then
+    if install_npm_global_package "T3Code CLI" "t3"; then
+      t3code_updated=0
+    fi
+  elif [ -n "$path" ] && is_windows_path "$path"; then
     skip "T3Code only resolves to a Windows PATH shim in WSL: $path"
-  else
-    skip "T3Code is not installed in a recognized WSL location."
   fi
-else
+fi
+if [ "$t3code_updated" -eq 0 ]; then
   print_version "T3Code CLI" t3
+fi
+
+if [ "$FAILURES" -gt 0 ]; then
+  printf '\nWARNING: WSL updates finished with %s failed command(s).\n' "$FAILURES"
+  exit 1
 fi
 '@
 
@@ -866,14 +1185,18 @@ fi
     try {
         $wslScriptPath = ConvertTo-WslPath $tempScript.FullName
         if ([string]::IsNullOrWhiteSpace($wslScriptPath)) {
-            Write-Warning "Could not translate temporary script path for WSL distro '$Distro'."
+            $message = "Could not translate temporary script path for WSL distro '$Distro'."
+            Write-Warning $message
+            Register-UpdateFailure $message
             return
         }
 
         $dryRunValue = if ($DryRun) { "1" } else { "0" }
         wsl.exe -d $Distro -- env "T3_UPDATE_DRY_RUN=$dryRunValue" bash $wslScriptPath
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "WSL update block failed with exit code $LASTEXITCODE."
+            $message = "WSL update block failed with exit code $LASTEXITCODE."
+            Write-Warning $message
+            Register-UpdateFailure $message
         }
     }
     finally {
@@ -903,4 +1226,13 @@ if ([string]::IsNullOrWhiteSpace($WslDistro)) {
 }
 
 Write-Host ""
-Write-Host "AI CLI updater finished." -ForegroundColor Cyan
+if ($script:Failures.Count -gt 0) {
+    Write-Host "AI CLI updater finished with $($script:Failures.Count) failure(s):" -ForegroundColor Red
+    foreach ($failure in $script:Failures) {
+        Write-Host "  - $failure" -ForegroundColor Red
+    }
+    exit 1
+}
+
+Write-Host "AI CLI updater finished successfully." -ForegroundColor Cyan
+exit 0
